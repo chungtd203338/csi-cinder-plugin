@@ -1,0 +1,205 @@
+---
+- name: Ensure CPO source folder
+  shell:
+    executable: /bin/bash
+    cmd: |
+      if [ ! -d $GOPATH/src/k8s.io/cloud-provider-openstack ]; then
+        mkdir -p $GOPATH/src/k8s.io; cd $_
+        git clone https://github.com/kubernetes/cloud-provider-openstack
+      fi
+
+- name: Build and upload cinder-csi-plugin image
+  shell:
+    executable: /bin/bash
+    cmd: |
+      cd $GOPATH/src/k8s.io/cloud-provider-openstack
+      VERSION="v0.0.99" # Fake version, but in proper format.
+
+      make push-multiarch-image-cinder-csi-plugin \
+        ARCHS='amd64' \
+        VERSION=${VERSION} \
+        REGISTRY={{ image_registry_host }}
+
+- name: Prepare cloud config
+  shell:
+    executable: /bin/bash
+    cmd: |
+      kubectl -n kube-system get secret cloud-config >/dev/null 2>&1
+      if [ $? -eq 0 ]; then
+        exit 0
+      fi
+
+      set -ex
+
+      set +x; source {{ devstack_workdir }}/openrc admin admin > /dev/null; set -x
+      tenant_id=$(openstack project show demo -c id -f value)
+      set +x; source {{ devstack_workdir }}/openrc demo demo > /dev/null; set -x
+      cat <<EOF > {{ ansible_user_dir }}/cloud.conf
+      [Global]
+      auth-url=${OS_AUTH_URL}
+      username=${OS_USERNAME}
+      password=${OS_PASSWORD}
+      region=${OS_REGION_NAME}
+      tenant-id=$tenant_id
+      domain-id=default
+
+      EOF
+
+      kubectl create secret -n kube-system generic cloud-config --from-file={{ ansible_user_dir }}/cloud.conf
+
+- name: Replace manifests
+  shell:
+    executable: /bin/bash
+    cmd: |
+      # replace manifest cloud secret file
+
+      b64data=`cat {{ ansible_user_dir }}/cloud.conf | base64 -w 0`
+      cd $GOPATH/src/k8s.io/cloud-provider-openstack
+
+      sed -i "/cloud\.conf/c\  cloud.conf: $b64data" manifests/cinder-csi-plugin/csi-secret-cinderplugin.yaml
+
+      VERSION="v0.0.99" # Fake version, but in proper format.
+      # replace image with built image
+      sed -i "s#registry.k8s.io/provider-os/cinder-csi-plugin:[^'\"]\+#{{ remote_registry_host }}/cinder-csi-plugin:${VERSION}#" manifests/cinder-csi-plugin/cinder-csi-controllerplugin.yaml
+      sed -i "s#registry.k8s.io/provider-os/cinder-csi-plugin:[^'\"]\+#{{ remote_registry_host }}/cinder-csi-plugin:${VERSION}#" manifests/cinder-csi-plugin/cinder-csi-nodeplugin.yaml
+
+      sed -i "s#--v=1#--v=5#" manifests/cinder-csi-plugin/cinder-csi-controllerplugin.yaml
+      sed -i "s#--v=1#--v=5#" manifests/cinder-csi-plugin/cinder-csi-nodeplugin.yaml
+- name: Deploy cinder-csi-plugin
+  shell:
+    executable: /bin/bash
+    cmd: |
+      cd $GOPATH/src/k8s.io/cloud-provider-openstack
+      kubectl apply -f manifests/cinder-csi-plugin
+  ignore_errors: true
+
+- name: Deploy snapshot manifests
+  shell:
+    executable: /bin/bash
+    cmd: |
+      kubectl apply -k 'github.com/kubernetes-csi/external-snapshotter/client/config/crd?ref=release-5.0'
+      kubectl apply -k 'github.com/kubernetes-csi/external-snapshotter/deploy/kubernetes/snapshot-controller?ref=release-5.0'
+  ignore_errors: yes
+
+- name: Wait for csi-cinder-controllerplugin up and running
+  shell:
+    executable: /bin/bash
+    cmd: |
+      kubectl -n kube-system get pod | grep csi-cinder-controllerplugin  | grep Running
+  register: check_csi_controller
+  until: check_csi_controller.rc == 0
+  retries: 24
+  delay: 5
+  ignore_errors: true
+
+- name: Wait for csi-cinder-nodeplugin up and running
+  shell:
+    executable: /bin/bash
+    cmd: |
+      kubectl -n kube-system get pod | grep csi-cinder-nodeplugin  | grep Running
+  register: check_csi_node
+  until: check_csi_node.rc == 0
+  retries: 24
+  delay: 5
+  ignore_errors: true
+
+- name: Wait for snapshot-controller deployment up and running
+  shell:
+    executable: /bin/bash
+    cmd: |
+      kubectl -n kube-system get pod | grep snapshot-controller  | grep Running
+  register: check_csi_snapshot
+  until: check_csi_snapshot.rc == 0
+  retries: 24
+  delay: 5
+  ignore_errors: yes
+
+- name: Gather additional evidence if csi-cinder-plugin failed to come up
+  when: check_csi_controller.failed or check_csi_node.failed or check_csi_snapshot.failed
+  block:
+    - name: Describe failed csi-cinder-plugin
+      shell:
+        executable: /bin/bash
+        cmd: |
+          kubectl get pods -A
+          kubectl -n kube-system describe deployment csi-cinder-controllerplugin
+          kubectl -n kube-system describe daemonset csi-cinder-nodeplugin
+          kubectl -n kube-system describe deployment snapshot-controller
+      register: describe_csi
+      changed_when: false
+
+    - name: Log failed csi-cinder-plugin deployment
+      debug:
+        var: describe_csi.stdout_lines
+
+    - name: get logs during error csi-cinder-plugin
+      shell:
+        executable: /bin/bash
+        cmd: |
+          set -x
+          set -e
+
+          kubectl logs deployment/csi-cinder-controllerplugin -n kube-system -c cinder-csi-plugin
+          kubectl logs daemonset/csi-cinder-nodeplugin -n kube-system -c cinder-csi-plugin
+
+          kubectl logs deployment/csi-cinder-controllerplugin -n kube-system -c cinder-csi-plugin > /var/log/csi-pod/csi-cinder-controllerplugin.log
+          kubectl logs daemonset/csi-cinder-nodeplugin -n kube-system -c cinder-csi-plugin > /var/log/csi-pod/csi-cinder-nodeplugin.log 
+    - name: &failmsg Stop due to prior failure of csi-cinder-plugin
+      fail:
+        msg: *failmsg
+
+- name: Fetch kubernetes-test-linux-amd64.tar.gz
+  unarchive:
+    src: "https://dl.k8s.io/{{ e2e_test_version }}/kubernetes-test-linux-amd64.tar.gz"
+    dest: /tmp/
+    remote_src: true
+    extra_opts:
+      - --add-file
+      - kubernetes/test/bin/e2e.test
+
+- name: Run functional tests for csi-cinder-plugin
+  shell:
+    executable: /bin/bash
+    cmd: |
+      set -x
+      set -e
+      set -o pipefail
+
+      cd $GOPATH/src/k8s.io/cloud-provider-openstack
+      mkdir -p /var/log/csi-pod
+      # TODO(chrigl): No idea why both tests fail in CI. On a real OpenStack both pass.
+      /tmp/kubernetes/test/bin/e2e.test \
+        -storage.testdriver=tests/e2e/csi/cinder/test-driver.yaml \
+        --ginkgo.focus='External.Storage' \
+        --ginkgo.skip='\[Disruptive\]|\[Testpattern:\s+Dynamic\s+PV\s+\(default\s+fs\)\]\s+provisioning\s+should\s+mount\s+multiple\s+PV\s+pointing\s+to\s+the\s+same\s+storage\s+on\s+the\s+same\s+node|\[Testpattern:\s+Dynamic\s+PV\s+\(default\s+fs\)\]\s+provisioning\s+should\s+provision\s+storage\s+with\s+any\s+volume\s+data\s+source\s+\[Serial\]|should\s+support\s+expansion\s+of\s+pvcs\s+created\s+for\s+ephemeral\s+pvcs' \
+        --ginkgo.noColor \
+        --ginkgo.progress \
+        --ginkgo.v \
+        --ginkgo.timeout=24h \
+        -test.timeout=0 \
+        -report-dir="/var/log/csi-pod" | tee "/var/log/csi-pod/cinder-csi-e2e.log"
+  register: functional_test_result
+  ignore_errors: true
+
+- name: Collect pod logs for debug purpose
+  shell:
+    executable: /bin/bash
+    cmd: |
+      set -x
+      set -e
+
+      kubectl logs deployment/csi-cinder-controllerplugin -n kube-system -c cinder-csi-plugin > /var/log/csi-pod/csi-cinder-controllerplugin.log
+      kubectl logs daemonset/csi-cinder-nodeplugin -n kube-system -c cinder-csi-plugin > /var/log/csi-pod/csi-cinder-nodeplugin.log
+      kubectl -n kube-system exec $(kubectl -n kube-system get pod -l app=csi-cinder-nodeplugin -o name) -c cinder-csi-plugin -- dmesg -T > /var/log/csi-pod/dmesg.log
+  ignore_errors: true
+
+- name: Show dmesg logs
+  become: true
+  shell:
+    executable: /bin/bash
+    cmd: |
+      sudo dmesg -T > /var/log/csi-pod/dmesg_local.log
+  ignore_errors: true
+
+- fail: msg="The execution has failed because of errors."
+  when: functional_test_result.failed
